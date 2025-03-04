@@ -1,0 +1,78 @@
+from flask import Flask, jsonify, request
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+from google.cloud import storage
+from datetime import datetime
+import os
+import io
+import pytz
+
+app = Flask(__name__)
+
+@app.route('/ingestion', methods=['POST'])
+def ingestion(request):
+
+    ####################### Variáveis ##################################################################
+    timezone = pytz.timezone("America/Sao_Paulo")
+    current_month = datetime.now(timezone).strftime("%Y%m")
+    current_day = datetime.now(timezone).strftime("%Y%m%d")
+    current_day_validador = datetime.now(timezone).strftime("%Y-%m-%d")
+    current_datetime = datetime.now(timezone).strftime("%H%M%S")
+    SERVICE_ACCOUNT_FILE_GCS = os.path.join(os.path.dirname(__file__), 'credentials.json')
+    SCOPES = ['https://www.googleapis.com/auth/drive']
+
+    file_name = "BASE_AGENDAMENTO_PENDENCIA_MACRO.xlsb"
+
+    ####################### Conexões ###################################################################
+    # Google Drive
+    credentials_drive = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE_GCS, scopes=SCOPES)
+    service_drive = build('drive', 'v3', credentials=credentials_drive)
+
+    # Storage
+    credentials_gcs = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE_GCS)
+    storage_client = storage.Client(project="cloud-macro-tim", credentials=credentials_gcs)
+
+    ###################### Buscar Arquivo e Baixar ######################################################
+    
+    results = service_drive.files().list(
+        q=f"name='{file_name}' and trashed=false",
+        fields="files(id, name, mimeType, modifiedTime)",
+        pageSize=100
+    ).execute()
+    
+    items = results.get('files', [])
+    if not items:
+            return jsonify({"message": f"Nenhum arquivo encontrado com o nome '{file_name}'."}), 404
+    
+    data_arquivo = [i['modifiedTime'].split("T")[0] for i in items][0]
+    
+    if current_day_validador == data_arquivo:
+        
+        item = items[0]
+        file_id = item['id']
+
+        requisitar = service_drive.files().get_media(fileId=file_id)
+        file_io = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_io, requisitar)
+        
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        file_io.seek(0)
+
+        #################### Armazenar no Google Cloud Storage #############################################
+        bucket_name = "tim-ultrafibra-gcs-sp"
+        bucket = storage_client.get_bucket(bucket_name)
+        
+        file_name = f"{current_day}-{current_datetime}.xlsb"
+        blob = bucket.blob(f"raw-zone/ultrafibra-base-agendamento/{current_month}/{file_name}")
+        
+        blob.upload_from_file(file_io, content_type='application/vnd.ms-excel.binary')
+
+        return jsonify(f"Arquivo {file_name} carregado no bucket {bucket_name}."), 200
+    return jsonify({'mensagem': f'Nenhum arquivo de {current_day} encontrado'}), 404
+
+if __name__ == '__main__':
+    app.run()
